@@ -714,6 +714,7 @@ version = "0.1.0"
 dependencies = [
  "calamine",
  "docx-rs",
+ "dunce",
  "git2",
  "libc",
  "pdf-extract",
@@ -737,6 +738,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip 8.6.0",
 ]
 
