@@ -67,8 +67,8 @@ export function chooseSourceFiles(): Promise<string[]> {
   return invoke('choose_source_files');
 }
 
-export function ingestFiles(spaceSlug: string, sourcePaths: string[]): Promise<IngestFileOutcome[]> {
-  return invoke('local_ingest_files', { spaceSlug, sourcePaths });
+export function ingestFiles(spaceSlug: string, sourcePaths: string[], allowLocalTools = false): Promise<IngestFileOutcome[]> {
+  return invoke('local_ingest_files', { spaceSlug, sourcePaths, allowLocalTools });
 }
 
 export function submit(spaceSlug: string, paths: string[]): Promise<unknown> {

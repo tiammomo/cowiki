@@ -203,6 +203,7 @@ pub struct IngestFileOutcome {
     pub source_path: String,
     pub source: Option<SourceItem>,
     pub error: Option<String>,
+    pub extraction: Option<crate::extract::ExtractionReport>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -636,7 +637,8 @@ impl LocalEngine {
         } else {
             requested.trim()
         };
-        let source = self.write_source_document(&space, requested, title, content.trim(), None)?;
+        let source =
+            self.write_source_document(&space, requested, title, content.trim(), None, None)?;
         self.refresh_source_views(&space)?;
         Ok(source)
     }
@@ -645,29 +647,58 @@ impl LocalEngine {
     /// `extract::read_source_file` recognizes. Keeps going past a single
     /// file's failure — an unsupported format or an unreadable file in a
     /// multi-select should not block the rest of the batch.
+    #[cfg(test)]
     pub fn ingest_files(
         &self,
         space_slug: &str,
         source_paths: &[String],
     ) -> Result<Vec<IngestFileOutcome>, String> {
+        self.ingest_files_with_options(space_slug, source_paths, false)
+    }
+
+    pub fn ingest_files_with_options(
+        &self,
+        space_slug: &str,
+        source_paths: &[String],
+        allow_local_tools: bool,
+    ) -> Result<Vec<IngestFileOutcome>, String> {
         let space = self.find_space(space_slug)?;
         okf::ensure_supported_for_write(&space.local_path)?;
         let outcomes = source_paths
             .iter()
-            .map(
-                |source_path| match self.ingest_one_file(&space, source_path) {
+            .map(|source_path| {
+                let extracted =
+                    crate::extract::read_source_file(Path::new(source_path), allow_local_tools);
+                let mut report = extracted.report;
+                let result = if report.status == crate::extract::QualityStatus::Fail {
+                    Err(report.diagnostics.join(" "))
+                } else {
+                    self.ingest_one_file(
+                        &space,
+                        source_path,
+                        &extracted.markdown,
+                        &extracted.content_hash,
+                        &report,
+                    )
+                };
+                match result {
                     Ok(source) => IngestFileOutcome {
                         source_path: source_path.clone(),
                         source: Some(source),
                         error: None,
+                        extraction: Some(report),
                     },
-                    Err(error) => IngestFileOutcome {
-                        source_path: source_path.clone(),
-                        source: None,
-                        error: Some(error),
-                    },
-                },
-            )
+                    Err(error) => {
+                        report.status = crate::extract::QualityStatus::Fail;
+                        IngestFileOutcome {
+                            source_path: source_path.clone(),
+                            source: None,
+                            error: Some(error),
+                            extraction: Some(report),
+                        }
+                    }
+                }
+            })
             .collect::<Vec<_>>();
         if outcomes.iter().any(|outcome| outcome.source.is_some()) {
             self.refresh_source_views(&space)?;
@@ -675,18 +706,15 @@ impl LocalEngine {
         Ok(outcomes)
     }
 
-    fn ingest_one_file(&self, space: &Space, source_path: &str) -> Result<SourceItem, String> {
+    fn ingest_one_file(
+        &self,
+        space: &Space,
+        source_path: &str,
+        text: &str,
+        content_hash: &str,
+        report: &crate::extract::ExtractionReport,
+    ) -> Result<SourceItem, String> {
         let path = Path::new(source_path);
-        if !crate::extract::is_supported(path) {
-            // Fail before reading the file at all — no point hashing a
-            // potentially large file CoWiki already knows it can't parse.
-            return Err(format!(
-                "'{source_path}' is not a supported source format (supported: {})",
-                crate::extract::all_supported_extensions().join(", ")
-            ));
-        }
-        let text = crate::extract::read_source_file(path)?;
-        let content_hash = sha256_file(path)?;
         let original_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -695,16 +723,22 @@ impl LocalEngine {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or(original_name);
-        self.write_source_document(space, original_name, title, &text, Some(&content_hash))
+        self.write_source_document(
+            space,
+            original_name,
+            title,
+            text,
+            Some(content_hash),
+            Some(report),
+        )
     }
 
     /// Shared write path for every ingest flavor: pasted text, a URL
     /// placeholder, or text extracted from an imported file.
     ///
     /// A file re-imported under its original name is common (re-syncing a
-    /// folder, clicking Import twice by accident) and should update the
-    /// same Source rather than pile up copies — so when `content_hash` is
-    /// given and matches what's already on disk, this returns the existing
+    /// folder, clicking Import twice by accident). When both the original
+    /// bytes and extracted Markdown match the stored hashes, return the existing
     /// Source without writing so human or Agent annotations survive. A name
     /// collision with genuinely different content gets a hash-derived (not
     /// random) suffix, so re-importing *that* file is still idempotent instead
@@ -718,11 +752,15 @@ impl LocalEngine {
         title: &str,
         body_text: &str,
         content_hash: Option<&str>,
+        extraction: Option<&crate::extract::ExtractionReport>,
     ) -> Result<SourceItem, String> {
+        let extraction_hash = extraction.map(|_| sha256_bytes(body_text.trim().as_bytes()));
         let relative = okf::source_storage_path(requested_filename)?;
         let mut candidate = checked_space_path(&space.local_path, &relative)?;
         if candidate.exists() {
-            if content_hash.is_some_and(|hash| source_hash_matches(&candidate, hash)) {
+            if content_hash.is_some_and(|hash| {
+                source_hash_matches(&candidate, hash, extraction_hash.as_deref())
+            }) {
                 return source_item_for_path(space, &candidate);
             }
 
@@ -732,15 +770,19 @@ impl LocalEngine {
                 .to_string_lossy()
                 .into_owned();
             if let Some(hash) = content_hash {
+                let collision_hash = extraction_hash
+                    .as_ref()
+                    .map(|extracted| sha256_bytes(format!("{hash}:{extracted}").as_bytes()))
+                    .unwrap_or_else(|| hash.to_string());
                 let mut found = None;
                 for suffix_len in [8, 16, 32, hash.len()] {
-                    let suffix = hash.get(..suffix_len).unwrap_or(hash);
+                    let suffix = collision_hash.get(..suffix_len).unwrap_or(&collision_hash);
                     let next = candidate.with_file_name(format!("{stem}-{suffix}.md"));
                     if !next.exists() {
                         found = Some(next);
                         break;
                     }
-                    if source_hash_matches(&next, hash) {
+                    if source_hash_matches(&next, hash, extraction_hash.as_deref()) {
                         return source_item_for_path(space, &next);
                     }
                 }
@@ -769,6 +811,14 @@ impl LocalEngine {
         let mut frontmatter = format!("title: {}\ntype: Source\n", yaml_string(title));
         if let Some(hash) = content_hash {
             frontmatter.push_str(&format!("source_hash: {}\n", yaml_string(hash)));
+        }
+        if let Some(hash) = extraction_hash {
+            frontmatter.push_str(&format!("source_extraction_hash: {}\n", yaml_string(&hash)));
+        }
+        if let Some(report) = extraction {
+            // JSON is valid YAML and keeps diagnostics safely inside one frontmatter value.
+            let metadata = serde_json::to_string(report).map_err(|error| error.to_string())?;
+            frontmatter.push_str(&format!("cowiki_extraction: {metadata}\n"));
         }
         let body = format!("---\n{frontmatter}---\n\n{}\n", body_text.trim());
         std::fs::write(&candidate, body).map_err(|error| error.to_string())?;
@@ -2077,28 +2127,13 @@ fn yaml_string(value: &str) -> String {
     )
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let bytes_read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn source_hash_matches(path: &Path, expected_hash: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|existing| frontmatter_field(&existing, "source_hash"))
-        .is_some_and(|existing_hash| existing_hash == expected_hash)
+fn source_hash_matches(path: &Path, expected_hash: &str, extraction_hash: Option<&str>) -> bool {
+    std::fs::read_to_string(path).ok().is_some_and(|existing| {
+        frontmatter_field(&existing, "source_hash").as_deref() == Some(expected_hash)
+            && extraction_hash.is_none_or(|hash| {
+                frontmatter_field(&existing, "source_extraction_hash").as_deref() == Some(hash)
+            })
+    })
 }
 
 fn source_item_for_path(space: &Space, path: &Path) -> Result<SourceItem, String> {
@@ -2280,7 +2315,7 @@ pub(crate) fn markdown_title(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sha256_file, CloudLink, LocalEngine};
+    use super::{CloudLink, LocalEngine};
     use git2::Repository;
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::Duration;
@@ -4170,6 +4205,52 @@ mod tests {
     }
 
     #[test]
+    fn ingest_quality_metadata_survives_restart_and_failed_text_is_not_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = temp.path().join("metadata");
+        let engine = LocalEngine::open(&metadata).unwrap();
+        let folder = temp.path().join("knowledge");
+        std::fs::create_dir_all(&folder).unwrap();
+        let space = engine.add_space("Knowledge", "knowledge", &folder).unwrap();
+        let good = temp.path().join("good.txt");
+        let bad = temp.path().join("bad.txt");
+        std::fs::write(&good, "Readable text with one damaged glyph \u{fffd}.").unwrap();
+        std::fs::write(&bad, "\u{fffd}\u{e000}").unwrap();
+        let outcomes = engine
+            .ingest_files(
+                &space.slug,
+                &[
+                    good.to_string_lossy().into_owned(),
+                    bad.to_string_lossy().into_owned(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            outcomes[0].extraction.as_ref().unwrap().status,
+            crate::extract::QualityStatus::Warn
+        );
+        assert_eq!(
+            outcomes[1].extraction.as_ref().unwrap().status,
+            crate::extract::QualityStatus::Fail
+        );
+        assert!(outcomes[1].source.is_none());
+        let item = outcomes[0].source.as_ref().unwrap();
+        let stored =
+            std::fs::read_to_string(folder.join(".cowiki/sources").join(&item.filename)).unwrap();
+        assert!(stored.contains("cowiki_extraction:"));
+        assert!(stored.contains("\"status\":\"warn\""));
+        assert!(stored.contains("source_hash:"));
+        drop(engine);
+        let reopened = LocalEngine::open(&metadata).unwrap();
+        assert_eq!(reopened.list_sources(&space.slug).unwrap().len(), 1);
+        assert!(reopened
+            .get_source(&space.slug, &item.filename)
+            .unwrap()
+            .content
+            .contains("Readable text"));
+    }
+
+    #[test]
     fn reimporting_same_content_reuses_source_and_different_content_stays_separate() {
         let temp = tempfile::tempdir().unwrap();
         let engine = LocalEngine::open(&temp.path().join("metadata")).unwrap();
@@ -4277,13 +4358,63 @@ mod tests {
     }
 
     #[test]
+    fn improved_extraction_preserves_old_annotations_and_reimports_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = LocalEngine::open(&temp.path().join("metadata")).unwrap();
+        let folder = temp.path().join("knowledge");
+        std::fs::create_dir_all(&folder).unwrap();
+        let space = engine.add_space("Knowledge", "knowledge", &folder).unwrap();
+        let report = crate::extract::ExtractionReport::new("docx");
+        let hash = "a".repeat(64);
+        let old = engine
+            .write_source_document(
+                &space,
+                "notes.docx",
+                "Notes",
+                "Partial text",
+                Some(&hash),
+                Some(&report),
+            )
+            .unwrap();
+        let old_path = folder.join(".cowiki/sources").join(&old.filename);
+        let annotated = format!(
+            "{}\nPreserve this annotation.\n",
+            std::fs::read_to_string(&old_path).unwrap()
+        );
+        std::fs::write(&old_path, &annotated).unwrap();
+        let recovered = engine
+            .write_source_document(
+                &space,
+                "notes.docx",
+                "Notes",
+                "Complete recovered text",
+                Some(&hash),
+                Some(&report),
+            )
+            .unwrap();
+        let repeated = engine
+            .write_source_document(
+                &space,
+                "notes.docx",
+                "Notes",
+                "Complete recovered text",
+                Some(&hash),
+                Some(&report),
+            )
+            .unwrap();
+        assert_ne!(old.filename, recovered.filename);
+        assert_eq!(recovered.filename, repeated.filename);
+        assert_eq!(std::fs::read_to_string(&old_path).unwrap(), annotated);
+    }
+
+    #[test]
     fn source_hashing_streams_the_complete_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("source.txt");
         std::fs::write(&path, "abc").unwrap();
 
         assert_eq!(
-            sha256_file(&path).unwrap(),
+            crate::extract::read_source_file(&path, false).content_hash,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -4298,7 +4429,7 @@ mod tests {
 
         let good = temp.path().join("notes.txt");
         std::fs::write(&good, "Readable notes.").unwrap();
-        let unsupported = temp.path().join("archive.doc");
+        let unsupported = temp.path().join("archive.rar");
         std::fs::write(&unsupported, b"legacy binary format").unwrap();
 
         let outcomes = engine
