@@ -17,6 +17,8 @@ use crate::knowledge_index::{self, SearchHit};
 use crate::okf::{self, DocumentKind};
 
 mod agent_changes;
+#[cfg(test)]
+mod benchmarks;
 pub use crate::knowledge_index::BrokenLink;
 pub use agent_changes::AgentChange;
 

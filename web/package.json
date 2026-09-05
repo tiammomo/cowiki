@@ -34,7 +34,8 @@
     "test:cloud-space-dialog": "node --experimental-strip-types --test tests/cloud-space-dialog.test.ts",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "bench:ui": "node scripts/benchmark-ui.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
