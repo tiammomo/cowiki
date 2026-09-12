@@ -51,8 +51,12 @@ start in a managed Git worktree. Background snapshots and migration rollback
 preserve the original LF/CRLF file bytes without changing your Git settings.
 
 Desktop and MCP both store derived metadata in `%USERPROFILE%\cowiki\.cowiki`.
-`HOME` is a fallback only when `USERPROFILE` is missing or not absolute. Spaces
-remain ordinary folders at the locations you select. Do not copy a live SQLite
+`HOME` is a fallback only when `USERPROFILE` is missing or not absolute.
+On macOS/Linux, an unavailable `HOME` retains the previous Tauri application-data
+fallback (`<platform data directory>/app.cowiki.desktop/cowiki/.cowiki`). Desktop
+and MCP resolve it identically, so previously registered Spaces remain visible.
+
+Spaces remain ordinary folders at the locations you select. Do not copy a live SQLite
 index between Windows and WSL; open the Markdown Space on the intended platform.
 
 ## Build from source
