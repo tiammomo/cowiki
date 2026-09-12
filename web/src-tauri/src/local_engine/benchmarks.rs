@@ -390,15 +390,20 @@ fn benchmark_smoke_exercises_the_complete_offline_workflow() {
         complete["settings"]["mutation_samples"],
         complete["corpora"][0]["metrics"]["startup_warm"]["samples"]
     );
-    assert!(complete["source"]["commit"]
-        .as_str()
-        .is_some_and(|value| value.len() == 40));
-    assert!(complete["toolchain"]["rustc"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("rustc ")));
-    assert!(complete["toolchain"]["cargo"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("cargo ")));
+    let commit = &complete["source"]["commit"];
+    assert!(commit.is_null() || commit.as_str().is_some_and(|value| value.len() == 40));
+    // Cross-compiled test runners and source archives need not have the build
+    // toolchain or Git installed. Missing provenance is explicitly null.
+    for (tool, prefix) in [("rustc", "rustc "), ("cargo", "cargo ")] {
+        let value = &complete["toolchain"][tool];
+        assert!(
+            value.is_null()
+                || value
+                    .as_str()
+                    .is_some_and(|value| value.starts_with(prefix))
+        );
+    }
+    assert!(provenance_output("cowiki-nonexistent-provenance-tool", &[]).is_none());
 }
 
 #[test]
