@@ -6,10 +6,13 @@ import { gzipSync } from 'node:zlib';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createServer } from 'vite';
+import { benchmarkProvenance } from './benchmark-provenance.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const samples = Number(process.env.COWIKI_BENCH_UI_SAMPLES ?? 30);
 assert(Number.isInteger(samples) && samples > 0 && samples <= 1000, 'samples must be 1–1000');
+const provenance = benchmarkProvenance(root);
+const sizes = [100, 1000, 10000];
 const vite = await createServer({ root, appType: 'custom', logLevel: 'silent', server: { middlewareMode: true, watch: null } });
 
 function measure(action) {
@@ -27,7 +30,7 @@ function measure(action) {
 try {
   const { visiblePageTree, findConcept, submitConceptPaths } = await vite.ssrLoadModule('/src/lib/okf-pages.ts');
   const { PageReader } = await vite.ssrLoadModule('/src/components/PageReader.tsx');
-  const corpora = [100, 1000, 10000].map((documents) => {
+  const corpora = sizes.map((documents) => {
     const pages = Array.from({ length: documents }, (_, index) => ({
       slug: `topic-${index}`, path: `topic-${index}.md`, title: `Topic ${index}`,
       summary: 'Local Markdown and Git knowledge', kind: 'page', branch: 'main', children: [],
@@ -53,7 +56,8 @@ try {
     assets.push({ filename, bytes: content.length, gzip_bytes: gzipSync(content).length });
   }
   const report = {
-    schema_version: 1, node: process.version, os: process.platform, arch: process.arch,
+    schema_version: 2, ...provenance, node: process.version, os: process.platform, arch: process.arch,
+    settings: { sizes, samples, fixture_version: 1, warmup_iterations: 1, page_reader_paragraphs: 20, latency_percentile: 'nearest-rank', rendering: 'SSR', assets: 'dist/assets' },
     scope: 'Node timings of production navigation helpers and PageReader SSR; excludes browser layout, paint, IPC and PTY.',
     corpora, page_reader_ssr: pageRender, assets,
     max_rss_bytes: process.resourceUsage().maxRSS * 1024,

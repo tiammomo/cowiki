@@ -265,6 +265,42 @@ fn bounded_setting(name: &str, default: usize, max: usize) -> usize {
     value
 }
 
+fn provenance_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn benchmark_report(
+    sizes: &[usize],
+    searches: usize,
+    mutations: usize,
+    corpora: Vec<Value>,
+) -> Value {
+    let status = provenance_output(
+        "git",
+        &["status", "--porcelain", "--untracked-files=normal"],
+    );
+    json!({
+        "schema_version": 2, "fixture_version": 1,
+        "source": { "commit": provenance_output("git", &["rev-parse", "--verify", "HEAD"]), "dirty": status.map(|value| !value.is_empty()) },
+        "toolchain": { "rustc": provenance_output("rustc", &["--version", "--verbose"]), "cargo": provenance_output("cargo", &["--version"]), "node": provenance_output("node", &["--version"]) },
+        "settings": { "sizes": sizes, "search_samples": searches, "mutation_samples": mutations, "fixture_version": 1, "paragraphs_per_document": 8, "documents_per_directory": 100, "search_limit": 20, "worker_process_per_corpus": true },
+        "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).ok(),
+        "startup_definition": "Fresh worker process with an existing healthy index; OS filesystem caches are not evicted.",
+        "latency_percentile": "nearest-rank", "corpora": corpora,
+    })
+}
+
 #[test]
 #[ignore = "run through desktop_benchmark; this is the fresh-process worker"]
 fn benchmark_worker() {
@@ -291,6 +327,10 @@ fn desktop_benchmark() {
         .collect::<Vec<_>>();
     assert!(!sizes.is_empty() && sizes.len() <= 3);
     assert!(sizes.iter().all(|value| (1..=10_000).contains(value)));
+    let searches = bounded_setting("COWIKI_BENCH_SEARCH_SAMPLES", 20, 1_000);
+    let mutations = bounded_setting("COWIKI_BENCH_MUTATION_SAMPLES", 5, 100);
+    // Capture the checkout and toolchain before fixture creation or measurements.
+    let mut report = benchmark_report(&sizes, searches, mutations, Vec::new());
     let mut results = Vec::new();
     for count in sizes {
         eprintln!("Preparing {count} documents (excluded from timings)...");
@@ -305,6 +345,8 @@ fn desktop_benchmark() {
             ])
             .env("COWIKI_BENCH_WORKER_ROOT", root.path())
             .env("COWIKI_BENCH_DOCUMENTS", count.to_string())
+            .env("COWIKI_BENCH_SEARCH_SAMPLES", searches.to_string())
+            .env("COWIKI_BENCH_MUTATION_SAMPLES", mutations.to_string())
             .output()
             .unwrap();
         assert!(
@@ -321,14 +363,7 @@ fn desktop_benchmark() {
         results.push(serde_json::from_str::<Value>(result).unwrap());
         eprintln!("Measured {count} documents.");
     }
-    let report = json!({
-        "schema_version": 1, "fixture_version": 1,
-        "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
-        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-        "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).ok(),
-        "startup_definition": "Fresh worker process with an existing healthy index; OS filesystem caches are not evicted.",
-        "latency_percentile": "nearest-rank", "corpora": results,
-    });
+    report["corpora"] = json!(results);
     let text = serde_json::to_string_pretty(&report).unwrap();
     if let Ok(path) = std::env::var("COWIKI_BENCH_OUTPUT") {
         std::fs::write(path, &text).unwrap();
@@ -344,6 +379,26 @@ fn benchmark_smoke_exercises_the_complete_offline_workflow() {
     assert_eq!(report["active_worktrees_after_cleanup"], 0);
     assert_eq!(report["metrics"]["search_warm"]["samples"], 2);
     assert!(report["sqlite_bytes"].as_u64().unwrap() > 0);
+    let complete = benchmark_report(&[3], 2, 1, vec![report]);
+    assert_eq!(complete["schema_version"], 2);
+    assert_eq!(complete["settings"]["sizes"], json!([3]));
+    assert_eq!(
+        complete["settings"]["search_samples"],
+        complete["corpora"][0]["metrics"]["search_warm"]["samples"]
+    );
+    assert_eq!(
+        complete["settings"]["mutation_samples"],
+        complete["corpora"][0]["metrics"]["startup_warm"]["samples"]
+    );
+    assert!(complete["source"]["commit"]
+        .as_str()
+        .is_some_and(|value| value.len() == 40));
+    assert!(complete["toolchain"]["rustc"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("rustc ")));
+    assert!(complete["toolchain"]["cargo"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("cargo ")));
 }
 
 #[test]

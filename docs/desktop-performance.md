@@ -28,6 +28,17 @@ mutation samples. For a quick check, `COWIKI_BENCH_SIZES=100` limits the corpus.
 `COWIKI_BENCH_UI_SAMPLES` adjust repetitions within documented code bounds.
 Do not compare debug and release measurements.
 
+New reports use schema version 2. Both engine and UI JSON embed `source.commit`,
+`source.dirty`, and `toolchain` entries for Rust, Cargo and Node. They record the
+effective corpus sizes and sample counts in `settings`; the UI also records its
+warmup/rendering settings. These values are captured before measurement. Missing
+Git/toolchain information is `null`, never substituted with a guessed revision.
+Run through the documented Cargo/npm commands in the checkout being measured,
+and rebuild `dist` before comparing UI asset sizes. A dirty checkout needs its
+patch preserved alongside the report; its commit alone does not identify it.
+The 2026-09-06 schema-v1 samples are retained as historical evidence and have not
+been relabeled with a newer checkout or toolchain.
+
 ## What is measured
 
 Each corpus consists of deterministic Markdown pages with frontmatter, eight
