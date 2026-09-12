@@ -198,7 +198,11 @@ fn extract_snapshot(path: &Path, allow_local_tools: bool) -> ExtractionResult {
         );
     if allow_local_tools && needs_fallback && can_convert {
         match local_tools::convert(path, &format, &mut report.attempts) {
-            Ok((text, extractor)) => {
+            Ok(local_tools::Conversion {
+                text,
+                extractor,
+                pages,
+            }) => {
                 let mut check = ExtractionReport::new(&format);
                 if quality::assess_text(&text, &mut check).is_ok() {
                     if let Err(error) = &validation {
@@ -206,6 +210,9 @@ fn extract_snapshot(path: &Path, allow_local_tools: bool) -> ExtractionResult {
                     }
                     report.warn("The native extraction was unavailable or unreliable; a local converter was used. Compare the result with the original.");
                     report.fallback(extractor);
+                    if let Some(pages) = pages {
+                        report.coverage(pages, pages, "PDF pages");
+                    }
                     candidate = Ok(text);
                 } else {
                     report.warn("The local converter also returned unreadable text.");
@@ -304,7 +311,7 @@ fn extract_native(
     match extension {
         "pdf" => {
             report.warn("PDF layout and reading order are not verified. Check columns, tables and image-only pages against the original.");
-            extract_pdf(path)
+            extract_pdf(path, report)
         }
         "docx" => {
             let xml = extract_zip_xml_part(path, "word/document.xml")?;
@@ -338,9 +345,83 @@ fn extension_of(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-fn extract_pdf(path: &Path) -> Result<String, String> {
-    pdf_extract::extract_text(path)
-        .map_err(|error| format!("cannot extract text from PDF: {error}"))
+fn extract_pdf(path: &Path, report: &mut ExtractionReport) -> Result<String, String> {
+    let pages = pdf_extract::extract_text_by_pages(path)
+        .map_err(|error| format!("cannot extract text from PDF: {error}"))?;
+    let extracted = pages
+        .iter()
+        .filter(|text| quality::assess_text(text, &mut ExtractionReport::new("pdf")).is_ok())
+        .count();
+    report.coverage(pages.len(), extracted, "PDF pages");
+    if pages.is_empty() || extracted != pages.len() {
+        return Err(format!("Only {extracted} of {} PDF pages contain readable text. Blank or scanned pages require local OCR or a text export; no partial PDF was imported.", pages.len()));
+    }
+    Ok(pages.join("\n\n"))
+}
+
+#[cfg(test)]
+mod mixed_pdf_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Mixed 中文 source.pdf");
+        std::fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/mixed-text-scan.pdf"),
+        )
+        .unwrap();
+        (root, path)
+    }
+
+    #[test]
+    fn mixed_pdf_never_succeeds_with_only_its_text_page() {
+        let (_root, path) = fixture();
+        let pages = pdf_extract::extract_text_by_pages(&path).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].contains("DIGITAL PAGE EVIDENCE"));
+        assert!(pages[1].trim().is_empty());
+        let result = read_source_file(&path, false);
+        assert_eq!(result.report.status, QualityStatus::Fail);
+        assert_eq!(result.report.expected_units, Some(2));
+        assert_eq!(result.report.extracted_units, Some(1));
+        assert!(result.markdown.is_empty());
+        assert!(result
+            .report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("no partial PDF")));
+    }
+
+    #[test]
+    #[ignore = "requires installed Poppler and Tesseract; run explicitly for converter validation"]
+    fn mixed_pdf_recovers_scanned_page_with_local_tools() {
+        let (_root, path) = fixture();
+        let result = read_source_file(&path, true);
+        assert_eq!(
+            result.report.status,
+            QualityStatus::Fallback,
+            "{:?}",
+            result.report
+        );
+        assert_eq!(result.report.expected_units, Some(2));
+        assert_eq!(result.report.extracted_units, Some(2));
+        assert!(result.markdown.contains("DIGITAL PAGE EVIDENCE"));
+        assert!(
+            result.markdown.contains("SCANNED PAGE EVIDENCE"),
+            "{}",
+            result.markdown
+        );
+        assert_eq!(
+            result
+                .report
+                .attempts
+                .iter()
+                .filter(|tool| *tool == "tesseract")
+                .count(),
+            1
+        );
+    }
 }
 
 fn extract_docx(path: &Path) -> Result<String, String> {

@@ -15,6 +15,13 @@ Reports contain the format, selected extractor and contract version, character
 count, available expected/extracted unit counts, attempted extraction paths, and
 actionable diagnostics. PPTX coverage counts slides; spreadsheet coverage counts
 sheets. Empty units are reported because they can contain visual-only content.
+PDF coverage is checked per page. A readable text page cannot hide an empty or
+unreadable page elsewhere in the document: that import requires recovery and
+fails without complete output. With local tools enabled, Poppler text is kept
+for readable pages and OCR is attempted for the missing pages. This conservative
+check also flags genuinely blank pages; export/remove those pages when OCR
+cannot recover content. Text within an otherwise readable page can still be
+incomplete, so page coverage does not prove visual or semantic fidelity.
 DOCX native output is compared with document XML text; missing content falls back
 to a formatting-flattened XML extraction. Empty or predominantly unreadable glyph
 output fails, while partial damage is visible. These heuristics do not infer
@@ -40,11 +47,19 @@ account is required. CoWiki does not install tools automatically.
 
 - Images: Tesseract (`tesseract`). Install language data appropriate to your input;
   the current adapter uses the tool's default language.
-- PDF recovery: Poppler (`pdftotext`, then `pdfinfo`/`pdftoppm`) and Tesseract.
+- PDF recovery: Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`) and Tesseract.
 - Legacy `.doc`: antiword.
 
 The adapter launches fixed programs and argument arrays without a shell, with a
-clean environment and closed stdin. Local extraction has a 90-second total budget
+clean environment and closed stdin.
+Tools are resolved to absolute executable paths before the environment is
+cleared. On Windows, add the native `.exe` directories to PATH and restart
+CoWiki; batch/PowerShell wrappers and WSL-only tools are unsupported. On Unix,
+absolute PATH entries and standard system/Homebrew directories are searched.
+Only OS temporary/system directory variables are retained for converter startup.
+No Agent or Cloud credentials are inherited.
+
+Local extraction has a 90-second total budget
 and a 32 MiB text limit. Scanned PDFs are limited to 20 pages; pages render at up
 to 2,000 pixels on their longest edge. A missing tool, timeout or unreadable OCR
 page produces an actionable failure; an incomplete OCR PDF is never presented as
@@ -63,3 +78,10 @@ Run the normal web and Rust suites. Regression fixtures cover partial slide
 coverage, DOCX nested text recovery, unreadable nonempty input, Unicode text,
 structured-text fences, opt-in conversion, tool timeouts, batch failures and
 portable quality metadata. No test requires an external model or network service.
+The checked-in mixed PDF has one text page and one image-only page. Its ordinary
+test rejects partial native extraction; the opt-in real Poppler/Tesseract test
+recovers both pages and confirms that OCR runs only for the scanned page:
+
+```sh
+cargo test --locked --manifest-path web/src-tauri/Cargo.toml mixed_pdf_recovers_scanned_page_with_local_tools -- --ignored --nocapture
+```
