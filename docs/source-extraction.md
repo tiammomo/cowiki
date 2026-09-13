@@ -36,8 +36,12 @@ deterministic Source; old Sources are not silently overwritten or rewritten to a
 
 Structured text (JSON, YAML, CSV/TSV, XML and local HTML listings) is preserved in
 Markdown code fences. Local HTML uses a `text` fence so it cannot become an
-interactive HTML View. Web-page capture belongs to the separate URL adapter
-(PR #144); this change does not replace it with a second fetch implementation.
+interactive HTML View. Web-page capture uses the URL adapter already on `dev`
+(PR #144). The shared Source writer preserves its origin URL and capture metadata.
+Web identity includes both the URL and content hash, so several URLs with the
+same title and body remain distinct from each other and from imported files.
+Re-imports also recognize the adapter's older hash-suffixed paths, preserving
+existing annotations without migrating or rewriting Sources.
 
 ## Optional local converters
 
@@ -80,8 +84,10 @@ structured-text fences, opt-in conversion, tool timeouts, batch failures and
 portable quality metadata. No test requires an external model or network service.
 The checked-in mixed PDF has one text page and one image-only page. Its ordinary
 test rejects partial native extraction; the opt-in real Poppler/Tesseract test
-recovers both pages and confirms that OCR runs only for the scanned page:
+recovers both pages and confirms that OCR runs only for the scanned page. A second
+integration test reopens the local engine and verifies that re-importing the
+recovered PDF preserves the Source and its annotations:
 
 ```sh
-cargo test --locked --manifest-path web/src-tauri/Cargo.toml mixed_pdf_recovers_scanned_page_with_local_tools -- --ignored --nocapture
+cargo test --locked --manifest-path web/src-tauri/Cargo.toml mixed_pdf_ -- --ignored --nocapture
 ```
